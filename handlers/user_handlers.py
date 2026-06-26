@@ -4,6 +4,7 @@ import os
 import time
 import logging
 import tempfile
+import asyncio
 
 import httpx
 from telegram import Update
@@ -14,6 +15,13 @@ import config
 import services.database as db
 import services.geolocation as geo
 from utils.ratelimit import check_rate_limit
+from utils.formatters import (
+    format_ip_result,
+    format_zip_result,
+    format_domain_result,
+    format_whois_result,
+    format_rdns_result,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +42,25 @@ def _ensure_user(update: Update) -> bool:
     return True
 
 
+async def _send_too_long(update: Update, text: str) -> None:
+    """Send text, handling Telegram's 4096-char limit by splitting if needed."""
+    if len(text) <= 4096:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        return
+    # Split on section boundaries if possible
+    parts = text.split("\n━━━")
+    chunk = parts[0]
+    for part in parts[1:]:
+        candidate = chunk + "\n━━━" + part
+        if len(candidate) > 4000:
+            await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+            chunk = "━━━" + part
+        else:
+            chunk = candidate
+    if chunk:
+        await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+
+
 # ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
@@ -47,13 +74,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
     text = (
-        "👋 Welcome to the **IP & Postal Code Lookup Bot**!\n\n"
-        "I can tell you where an IP address is located (country, city, ISP, "
-        "and more) and look up postal/zip codes around the world.\n\n"
+        "👋 Welcome to the **IP Intelligence & OSINT Bot**!\n\n"
+        "I perform IP geolocation, domain resolution, WHOIS/RDAP lookups, "
+        "reverse DNS, risk analysis, and postal/zip code lookups — with "
+        "maps, bulk scanning, history, and CSV export.\n\n"
         "📌 *Commands:*\n"
-        "/ip `<ip>` — Geolocate an IP address\n"
-        "/zip `<code>` — Look up a postal/zip code (defaults to US)\n"
-        "/zip `<country> <code>` — Look up a code in a specific country\n"
+        "/ip `<ip>` — IP intelligence report (geo + risk + maps)\n"
+        "/domain `<domain>` — Domain lookup (DNS + geo + risk)\n"
+        "/whois `<ip|domain>` — WHOIS / RDAP lookup\n"
+        "/rdns `<ip>` — Reverse DNS (PTR record)\n"
+        "/scan — Bulk IP scan from a TXT/CSV file\n"
+        "/zip `<code>` — Postal/zip code lookup (defaults to US)\n"
+        "/zip `<country> <code>` — Postal code for another country\n"
         "/history — View your last 10 lookups\n"
         "/export — Download your full history as a CSV\n"
         "/help — Show all commands\n\n"
@@ -73,17 +105,23 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = (
         "📖 *Command reference:*\n\n"
-        "/start — Welcome message & overview\n"
-        "/help — This help screen\n"
-        "/ip `<ip_address>` — Geolocate an IP address\n"
-        "/zip `<postal_code>` — Look up a postal/zip code (US default)\n"
-        "/zip `<country_code> <postal_code>` — Look up a code for another country\n"
+        "━━━ 🔍 *Lookup* ━━━\n"
+        "/ip `<ip>` — IP intelligence report (geo, ISP, ASN, risk, maps)\n"
+        "/domain `<domain>` — Resolve & geolocate a domain\n"
+        "/whois `<ip|domain>` — WHOIS / RDAP records\n"
+        "/rdns `<ip>` — Reverse DNS (PTR record)\n"
+        "/zip `<postal_code>` — Postal/zip code lookup (US default)\n"
+        "/zip `<country_code> <postal_code>` — Another country\n\n"
+        "━━━ 📂 *Bulk* ━━━\n"
+        "/scan — Upload a TXT/CSV file with IPs (one per line)\n\n"
+        "━━━ 📜 *History* ━━━\n"
         "/history — Your last 10 lookups\n"
-        "/export — Download your full history as CSV\n"
-        "/stats — (admin) Bot usage statistics\n"
-        "/broadcast `<message>` — (admin) Message all users\n"
-        "/ban `<user_id>` — (admin) Ban a user\n"
-        "/unban `<user_id>` — (admin) Unban a user\n"
+        "/export — Full history as CSV download\n\n"
+        "━━━ 🛡️ *Admin* (restricted) ━━━\n"
+        "/stats — Bot usage statistics\n"
+        "/broadcast `<message>` — Message all users\n"
+        "/ban `<user_id>` — Ban a user\n"
+        "/unban `<user_id>` — Unban a user\n"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -99,7 +137,6 @@ async def ip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     user = update.effective_user
 
-    # Rate limit
     allowed, remaining = check_rate_limit(user.id)
     if not allowed:
         await update.message.reply_text("⏳ Please wait a few seconds before your next lookup.")
@@ -111,7 +148,6 @@ async def ip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     ip = context.args[0].strip()
 
-    # Validate
     if not geo.is_valid_ip(ip):
         await update.message.reply_text(
             f"❌ `{ip}` is not a valid IP address.\n"
@@ -120,9 +156,9 @@ async def ip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
+    t0 = time.monotonic()
     cache_key = f"ip:{ip}"
 
-    # Check cache
     cached_json, cached_at = db.get_cache(cache_key)
     if cached_json is not None and _cache_fresh(cached_at):
         logging.info("Cache hit for %s", cache_key)
@@ -145,7 +181,7 @@ async def ip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         db.set_cache(cache_key, json.dumps(result))
 
-    # Handle API error status
+    # Handle API error status (private/reserved IP)
     if result.get("status") != "success":
         msg = result.get("message", "Unknown error")
         await update.message.reply_text(
@@ -154,27 +190,378 @@ async def ip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    text = _format_ip_result(ip, result)
+    # Risk analysis (uses ip-api flags + ipaddress classification)
+    risk = await geo.analyze_ip_risk(ip, result)
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    text = format_ip_result(ip, result, risk)
+    await _send_too_long(update, text)
+
+    db.save_lookup(
+        user.id, "ip", ip, json.dumps(result),
+        country=result.get("country"),
+        city=result.get("city"),
+        isp=result.get("isp"),
+        asn=result.get("as"),
+        lat=result.get("lat"),
+        lon=result.get("lon"),
+        risk_level=risk.get("level"),
+        lookup_time_ms=elapsed_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /domain
+# ---------------------------------------------------------------------------
+
+async def domain_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _ensure_user(update):
+        await update.message.reply_text("You are banned from using this bot.")
+        return
+
+    user = update.effective_user
+
+    allowed, _ = check_rate_limit(user.id)
+    if not allowed:
+        await update.message.reply_text("⏳ Please wait a few seconds before your next lookup.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /domain <domain>\nExample: /domain google.com")
+        return
+
+    domain = context.args[0].strip().lower().rstrip(".")
+
+    if not geo.is_valid_domain(domain):
+        await update.message.reply_text(
+            f"❌ `{domain}` is not a valid domain name.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    t0 = time.monotonic()
+    cache_key = f"domain:{domain}"
+
+    cached_json, cached_at = db.get_cache(cache_key)
+    if cached_json is not None and _cache_fresh(cached_at):
+        logging.info("Cache hit for %s", cache_key)
+        result = json.loads(cached_json)
+    else:
+        try:
+            result = await geo.lookup_domain(domain)
+        except httpx.TimeoutException:
+            await update.message.reply_text("⌛ Domain lookup timed out. Please try again later.")
+            logging.error("domain lookup timeout for %s", domain)
+            return
+        except httpx.HTTPError as e:
+            await update.message.reply_text("⚠️ Could not reach the lookup service. Please try again later.")
+            logging.error("domain lookup HTTP error for %s: %s", domain, e)
+            return
+        except (socket_gaierror := __import__("socket").gaierror) as e:
+            await update.message.reply_text(
+                f"❌ Could not resolve domain `{domain}`.\n"
+                "DNS resolution failed — check the domain spelling.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            logging.error("DNS resolution failed for %s: %s", domain, e)
+            return
+        except Exception as e:
+            await update.message.reply_text("⚠️ An unexpected error occurred.")
+            logging.error("domain lookup unexpected error for %s: %s", domain, e)
+            return
+
+        db.set_cache(cache_key, json.dumps(result))
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    text = format_domain_result(result)
+    await _send_too_long(update, text)
+
+    geo_data = result.get("geo") or {}
+    risk = result.get("risk") or {}
+    db.save_lookup(
+        user.id, "domain", domain, json.dumps(result),
+        country=geo_data.get("country"),
+        city=geo_data.get("city"),
+        isp=geo_data.get("isp"),
+        asn=geo_data.get("as"),
+        lat=geo_data.get("lat"),
+        lon=geo_data.get("lon"),
+        risk_level=risk.get("level"),
+        lookup_time_ms=elapsed_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /whois
+# ---------------------------------------------------------------------------
+
+async def whois_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _ensure_user(update):
+        await update.message.reply_text("You are banned from using this bot.")
+        return
+
+    user = update.effective_user
+
+    allowed, _ = check_rate_limit(user.id)
+    if not allowed:
+        await update.message.reply_text("⏳ Please wait a few seconds before your next lookup.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /whois <ip or domain>\nExample: /whois 8.8.8.8")
+        return
+
+    query = context.args[0].strip()
+    is_domain = not geo.is_valid_ip(query)
+
+    if is_domain:
+        normalized = query.lower().rstrip(".")
+        if not geo.is_valid_domain(normalized):
+            await update.message.reply_text(
+                f"❌ `{query}` is neither a valid IP nor a valid domain.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        query = normalized
+
+    cache_key = f"whois:{query}"
+
+    cached_json, cached_at = db.get_cache(cache_key)
+    if cached_json is not None and _cache_fresh(cached_at):
+        logging.info("Cache hit for %s", cache_key)
+        result = json.loads(cached_json)
+    else:
+        try:
+            if is_domain:
+                result = await geo.lookup_whois_domain(query)
+            else:
+                result = await geo.lookup_whois_ip(query)
+        except httpx.TimeoutException:
+            await update.message.reply_text("⌛ WHOIS lookup timed out. Please try again later.")
+            logging.error("whois timeout for %s", query)
+            return
+        except httpx.HTTPError as e:
+            await update.message.reply_text("⚠️ Could not reach the WHOIS service. Please try again later.")
+            logging.error("whois HTTP error for %s: %s", query, e)
+            return
+        except Exception as e:
+            await update.message.reply_text("⚠️ An unexpected error occurred.")
+            logging.error("whois unexpected error for %s: %s", query, e)
+            return
+
+        if result is None:
+            await update.message.reply_text(
+                f"❌ No WHOIS/RDAP records found for `{query}`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        db.set_cache(cache_key, json.dumps(result))
+
+    text = format_whois_result(query, result, is_domain=is_domain)
+    await _send_too_long(update, text)
+
+    db.save_lookup(user.id, "whois", query, json.dumps(result))
+
+
+# ---------------------------------------------------------------------------
+# /rdns
+# ---------------------------------------------------------------------------
+
+async def rdns_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _ensure_user(update):
+        await update.message.reply_text("You are banned from using this bot.")
+        return
+
+    user = update.effective_user
+
+    allowed, _ = check_rate_limit(user.id)
+    if not allowed:
+        await update.message.reply_text("⏳ Please wait a few seconds before your next lookup.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /rdns <ip>\nExample: /rdns 8.8.8.8")
+        return
+
+    ip = context.args[0].strip()
+
+    if not geo.is_valid_ip(ip):
+        await update.message.reply_text(
+            f"❌ `{ip}` is not a valid IP address.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    cache_key = f"rdns:{ip}"
+
+    cached_json, cached_at = db.get_cache(cache_key)
+    if cached_json is not None and _cache_fresh(cached_at):
+        logging.info("Cache hit for %s", cache_key)
+        hostname = json.loads(cached_json).get("hostname")
+    else:
+        try:
+            hostname = await geo.reverse_dns(ip)
+        except Exception as e:
+            await update.message.reply_text("⚠️ Reverse DNS lookup failed.")
+            logging.error("rdns error for %s: %s", ip, e)
+            return
+
+        db.set_cache(cache_key, json.dumps({"hostname": hostname}))
+
+    text = format_rdns_result(ip, hostname)
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-    db.save_lookup(user.id, "ip", ip, json.dumps(result))
+    db.save_lookup(user.id, "rdns", ip, json.dumps({"hostname": hostname}))
 
 
-def _format_ip_result(ip: str, r: dict) -> str:
-    return (
-        "🌍 *IP Lookup Result*\n"
-        f"📡 IP: `{ip}`\n"
-        f"🏳️ Country: {r.get('country', 'N/A')} ({r.get('countryCode', 'N/A')})\n"
-        f"🗺️ Region: {r.get('regionName', 'N/A')}\n"
-        f"🏙️ City: {r.get('city', 'N/A')}\n"
-        f"📮 Postal Code: {r.get('zip', 'N/A')}\n"
-        f"🛰️ ISP: {r.get('isp', 'N/A')}\n"
-        f"📍 Coordinates: {r.get('lat', 'N/A')}, {r.get('lon', 'N/A')}\n"
-        f"🕐 Timezone: {r.get('timezone', 'N/A')}\n"
-        "\n"
-        "⚠️ _Note: IP geolocation is approximate (city-level) "
-        "and does not reveal an exact street address._"
+# ---------------------------------------------------------------------------
+# /scan — bulk IP scanner
+# ---------------------------------------------------------------------------
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _ensure_user(update):
+        await update.message.reply_text("You are banned from using this bot.")
+        return
+
+    user = update.effective_user
+
+    if not update.message or not update.message.document:
+        await update.message.reply_text(
+            "📂 Send a TXT or CSV file with one IP per line.\n"
+            "Usage: reply with /scan and attach a file, or send the file then /scan."
+        )
+        return
+
+    document = update.message.document
+    file_obj = await document.get_file()
+    file_bytes = await file_obj.download_as_bytearray()
+
+    try:
+        raw = file_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        raw = file_bytes.decode("latin-1", errors="replace")
+
+    # Extract IPs: handle CSV (find IP-like column) and plain TXT
+    ips: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # If it looks like CSV, try each comma-separated cell
+        if "," in line:
+            for cell in line.split(","):
+                cell = cell.strip().strip('"').strip("'")
+                if cell and geo.is_valid_ip(cell):
+                    ips.append(cell)
+        else:
+            if geo.is_valid_ip(line):
+                ips.append(line)
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_ips = []
+    for ip in ips:
+        if ip not in seen:
+            seen.add(ip)
+            unique_ips.append(ip)
+
+    if not unique_ips:
+        await update.message.reply_text("❌ No valid IP addresses found in the file.")
+        return
+
+    if len(unique_ips) > config.BULK_MAX_IPS:
+        await update.message.reply_text(
+            f"⚠️ Found {len(unique_ips)} IPs. Limit is {config.BULK_MAX_IPS}. "
+            f"Only the first {config.BULK_MAX_IPS} will be scanned."
+        )
+        unique_ips = unique_ips[: config.BULK_MAX_IPS]
+
+    await update.message.reply_text(
+        f"🔍 Scanning {len(unique_ips)} IP(s)… This may take a moment."
     )
+
+    rows: list[dict] = []
+    for i, ip in enumerate(unique_ips):
+        # Check cache first
+        cache_key = f"ip:{ip}"
+        cached_json, cached_at = db.get_cache(cache_key)
+        result = None
+        if cached_json is not None and _cache_fresh(cached_at):
+            result = json.loads(cached_json)
+        else:
+            try:
+                result = await geo.lookup_ip(ip)
+                if result.get("status") == "success":
+                    db.set_cache(cache_key, json.dumps(result))
+            except Exception as e:
+                logging.warning("Bulk scan error for %s: %s", ip, e)
+                result = None
+
+        if result and result.get("status") == "success":
+            risk = await geo.analyze_ip_risk(ip, result)
+            rows.append({
+                "IP": ip,
+                "Country": result.get("country", ""),
+                "City": result.get("city", ""),
+                "ISP": result.get("isp", ""),
+                "ASN": result.get("as", ""),
+                "Risk": risk.get("level", ""),
+                "Latitude": result.get("lat", ""),
+                "Longitude": result.get("lon", ""),
+                "Status": "OK",
+            })
+        else:
+            rows.append({
+                "IP": ip,
+                "Country": "",
+                "City": "",
+                "ISP": "",
+                "ASN": "",
+                "Risk": "",
+                "Latitude": "",
+                "Longitude": "",
+                "Status": "FAIL",
+            })
+
+        # Small delay to respect ip-api rate limits
+        if (i + 1) % 45 == 0:
+            await asyncio.sleep(1)
+        else:
+            await asyncio.sleep(config.BULK_BATCH_DELAY)
+
+    # Generate CSV report
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".csv", prefix="bulk_scan_")
+        os.close(fd)
+        with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "IP", "Country", "City", "ISP", "ASN",
+                    "Risk", "Latitude", "Longitude", "Status",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+        with open(tmp_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=f,
+                filename="bulk_scan_report.csv",
+                caption=f"📊 Bulk scan complete: {len(rows)} IPs scanned.\n"
+                        f"✅ OK: {sum(1 for r in rows if r['Status'] == 'OK')}\n"
+                        f"❌ FAIL: {sum(1 for r in rows if r['Status'] == 'FAIL')}",
+            )
+    except Exception as e:
+        logging.error("Bulk scan CSV generation failed: %s", e)
+        await update.message.reply_text("⚠️ Could not generate the scan report.")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -200,9 +587,6 @@ async def zip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # Parse args: if 2 tokens, first is country; if 1 token and all digits,
-    # default to "us"; if 1 token that's not all digits, treat as country+code
-    # (we'll still try it as a single postal code for US).
     if len(context.args) == 2:
         country_code = context.args[0].strip().lower()
         postal_code = context.args[1].strip()
@@ -211,7 +595,6 @@ async def zip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if postal_code.isdigit():
             country_code = "us"
         else:
-            # e.g. user sent "gb SW1A1AA" as a single arg — try to split
             parts = postal_code.split(maxsplit=1)
             if len(parts) == 2:
                 country_code = parts[0].lower()
@@ -251,36 +634,10 @@ async def zip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         db.set_cache(cache_key, json.dumps(result))
 
-    text = _format_zip_result(country_code, postal_code, result)
+    text = format_zip_result(country_code, postal_code, result)
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
     db.save_lookup(user.id, "zip", f"{country_code} {postal_code}", json.dumps(result))
-
-
-def _format_zip_result(country_code: str, postal_code: str, result: dict) -> str:
-    country = result.get("country", "N/A")
-    country_abbrev = result.get("country abbreviation", country_code.upper())
-    places = result.get("places", [])
-
-    lines = [
-        "📮 *Postal Code Lookup Result*",
-        f"📮 Code: `{postal_code}`",
-        f"🌍 Country: {country} ({country_abbrev})",
-    ]
-
-    if len(places) == 1:
-        p = places[0]
-        lines.append(f"🏙️ City/Place: {p.get('place name', 'N/A')}")
-        lines.append(f"🗺️ State: {p.get('state', 'N/A')}")
-        lines.append(f"📍 Coordinates: {p.get('latitude', 'N/A')}, {p.get('longitude', 'N/A')}")
-    else:
-        lines.append("\n*Multiple places found:*")
-        for i, p in enumerate(places, 1):
-            lines.append(f"\n{i}. {p.get('place name', 'N/A')}")
-            lines.append(f"   🗺️ State: {p.get('state', 'N/A')}")
-            lines.append(f"   📍 {p.get('latitude', 'N/A')}, {p.get('longitude', 'N/A')}")
-
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -299,13 +656,19 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("📭 You have no lookup history yet. Try /ip or /zip to get started!")
         return
 
+    emoji_map = {
+        "ip": "🌐", "zip": "📮", "domain": "🌐", "whois": "📇",
+        "rdns": "🔁", "scan": "📂",
+    }
     lines = ["📋 *Your last 10 lookups:*\n"]
     for i, row in enumerate(rows, 1):
         ltype = row["lookup_type"]
         query = row["query_value"]
         created = row["created_at"]
-        emoji = "🌐" if ltype == "ip" else "📮"
-        lines.append(f"{i}. {emoji} `{query}` — {created}")
+        emoji = emoji_map.get(ltype, "🔎")
+        risk = row["risk_level"] if "risk_level" in row.keys() else None
+        risk_str = f" [{risk}]" if risk else ""
+        lines.append(f"{i}. {emoji} `{query}` — {created}{risk_str}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
@@ -340,10 +703,19 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     data = json.loads(row["result_json"]) if row["result_json"] else {}
                     if row["lookup_type"] == "ip":
                         result_summary = f"{data.get('city', '')}, {data.get('country', '')}"
-                    else:
+                    elif row["lookup_type"] == "domain":
+                        geo_data = data.get("geo", {})
+                        result_summary = f"{geo_data.get('city', '')}, {geo_data.get('country', '')}"
+                    elif row["lookup_type"] == "zip":
                         places = data.get("places", [])
                         names = [p.get("place name", "") for p in places]
                         result_summary = "; ".join(names)
+                    elif row["lookup_type"] == "whois":
+                        result_summary = data.get("organization", "") or data.get("netname", "")
+                    elif row["lookup_type"] == "rdns":
+                        result_summary = data.get("hostname", "") or "no PTR"
+                    else:
+                        result_summary = ""
                 except (json.JSONDecodeError, TypeError):
                     pass
 

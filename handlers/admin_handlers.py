@@ -29,28 +29,73 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await _admin_only(update):
         return
 
-    stats = db.get_stats()
+    stats = db.get_advanced_stats()
 
+    # Type breakdown
+    emoji_map = {
+        "ip": "🌐", "zip": "📮", "domain": "🖥️", "whois": "📇",
+        "rdns": "🔁", "scan": "📂",
+    }
+    type_lines = []
+    for ltype, count in stats["type_breakdown"].items():
+        emoji = emoji_map.get(ltype, "🔎")
+        type_lines.append(f"   {emoji} {ltype}: {count}")
+    type_text = "\n".join(type_lines) if type_lines else "   (none yet)"
+
+    # Top queries
     top_lines = []
     for query, count in stats["top_queries"]:
         top_lines.append(f"   `{query}` — {count}×")
     top_text = "\n".join(top_lines) if top_lines else "   (none yet)"
 
-    type_lines = []
-    for ltype, count in stats["type_breakdown"].items():
-        emoji = "🌐" if ltype == "ip" else "📮"
-        type_lines.append(f"   {emoji} {ltype}: {count}")
-    type_text = "\n".join(type_lines) if type_lines else "   (none yet)"
+    # Top countries
+    country_lines = []
+    for country, count in stats["top_countries"]:
+        country_lines.append(f"   🏳️ {country} — {count}×")
+    country_text = "\n".join(country_lines) if country_lines else "   (none yet)"
+
+    # Top ISPs
+    isp_lines = []
+    for isp, count in stats["top_isps"]:
+        isp_lines.append(f"   🏢 {isp} — {count}×")
+    isp_text = "\n".join(isp_lines) if isp_lines else "   (none yet)"
+
+    # Top domains
+    domain_lines = []
+    for domain, count in stats["top_domains"]:
+        domain_lines.append(f"   🖥️ `{domain}` — {count}×")
+    domain_text = "\n".join(domain_lines) if domain_lines else "   (none yet)"
+
+    # Daily graph (text-based bar chart for last 14 days)
+    graph_lines = []
+    if stats["daily_graph"]:
+        max_count = max(c for _, c in stats["daily_graph"]) or 1
+        for day, count in stats["daily_graph"]:
+            bar_len = max(1, int((count / max_count) * 20))
+            graph_lines.append(f"   {day} {'█' * bar_len} {count}")
+    graph_text = "\n".join(graph_lines) if graph_lines else "   (no data yet)"
 
     text = (
         "📊 *Bot Statistics*\n\n"
+        "━━━ 📈 *Overview* ━━━\n"
         f"👥 Total users: *{stats['total_users']}*\n"
         f"🔎 Total lookups: *{stats['total_lookups']}*\n"
-        f"📅 Lookups today: *{stats['lookups_today']}*\n\n"
-        "*Lookup breakdown:*\n"
+        f"📅 Lookups today: *{stats['lookups_today']}*\n"
+        f"⏱️ Avg lookup time: *{stats['avg_lookup_time_ms']} ms*\n"
+        f"💾 Cache entries: *{stats['cache_count']}*\n"
+        f"📊 Cache ratio: *{stats['cache_ratio']}%*\n\n"
+        "━━━ 🔍 *Lookup breakdown* ━━━\n"
         f"{type_text}\n\n"
-        "*Top 5 queried:*\n"
-        f"{top_text}"
+        "━━━ 🏆 *Top 5 queried* ━━━\n"
+        f"{top_text}\n\n"
+        "━━━ 🏳️ *Top countries* ━━━\n"
+        f"{country_text}\n\n"
+        "━━━ 🏢 *Top ISPs* ━━━\n"
+        f"{isp_text}\n\n"
+        "━━━ 🖥️ *Top domains* ━━━\n"
+        f"{domain_text}\n\n"
+        "━━━ 📅 *Daily lookups (14d)* ━━━\n"
+        f"{graph_text}"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 

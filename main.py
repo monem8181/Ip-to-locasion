@@ -25,6 +25,10 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("help", user_handlers.help_command))
     application.add_handler(CommandHandler("ip", user_handlers.ip_command))
     application.add_handler(CommandHandler("zip", user_handlers.zip_command))
+    application.add_handler(CommandHandler("domain", user_handlers.domain_command))
+    application.add_handler(CommandHandler("whois", user_handlers.whois_command))
+    application.add_handler(CommandHandler("rdns", user_handlers.rdns_command))
+    application.add_handler(CommandHandler("scan", user_handlers.scan_command))
     application.add_handler(CommandHandler("history", user_handlers.history_command))
     application.add_handler(CommandHandler("export", user_handlers.export_command))
 

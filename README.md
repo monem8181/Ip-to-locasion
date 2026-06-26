@@ -1,19 +1,43 @@
-# 🌍 Postal & IP Geolocation Telegram Bot
+# 🌍 IP Intelligence & OSINT Telegram Bot
 
-A full-featured Telegram bot that looks up **IP geolocation** and **postal/zip codes** with history tracking, rate limiting, caching, and an admin panel.
+A professional, production-ready Telegram bot for **IP intelligence**, **domain lookup**, **WHOIS/RDAP**, **reverse DNS**, **risk analysis**, **bulk IP scanning**, and **postal/zip code lookup** — with history tracking, rate limiting, caching, and an admin panel.
 
 ---
 
 ## ✨ Features
 
-- 🌐 **IP Geolocation** — country, region, city, postal code, ISP, coordinates, timezone
-- 📮 **Postal/Zip Code Lookup** — supports US, UK, Canada, and more (multi-place results)
-- 📜 **History** — view your last 10 lookups or export your full history as CSV
-- ⚡ **Rate Limiting** — 3-second cooldown per user between lookups
-- 💾 **Caching** — 30-minute TTL SQLite cache for both IP and postal lookups
-- 🛡️ **Admin Panel** — `/stats`, `/broadcast`, `/ban`, `/unban`
-- 🚫 **User Banning** — banned users are silently blocked
-- 🚀 **Railway-ready** — long-polling worker with persistent volume support
+### 🔍 Lookup & Intelligence
+- 🌐 **IP Intelligence** — country, region, city, postal, ISP, ASN, coordinates, timezone, reverse DNS, mobile/proxy/hosting flags
+- 🖥️ **Domain Lookup** — DNS resolution (IPv4+IPv6), geolocation, reverse DNS, risk analysis
+- 📇 **WHOIS / RDAP** — ASN, organization, netname, CIDR, abuse contact, registry, creation date (for IPs and domains)
+- 🔁 **Reverse DNS** — PTR record lookup with graceful "no record" handling
+- 📮 **Postal/Zip Lookup** — US, UK, Canada, and more (multi-place results)
+
+### 🛡️ Risk Analysis
+- 🟢🟡🔴 **Risk scoring** for every IP — detects private, loopback, reserved, multicast, proxy/VPN, hosting/datacenter, mobile, Tor exit node markers
+- Explains *why* each score was assigned
+- Never invents data — only uses reliable API responses
+
+### 📂 Bulk Scanner
+- 📄 **/scan** — upload a TXT or CSV file with one IP per line
+- Generates a CSV report (IP, Country, City, ISP, ASN, Risk, Lat, Lon, Status)
+- Cache-aware to minimize API calls
+- Respects ip-api rate limits (45 req/min)
+
+### 🗺️ Maps
+- Every IP/domain result includes Google Maps and OpenStreetMap links
+
+### 📜 History & Export
+- /history — last 10 lookups with risk levels
+- /export — full history as CSV download
+
+### ⚡ Rate Limiting & Caching
+- 3-second per-user cooldown
+- 30-minute TTL SQLite cache (IP, zip, domain, whois, rdns)
+
+### 🛡️ Admin Panel
+- /stats — total users, lookups, top countries, top ISPs, top domains, daily graph, avg lookup time, cache hit ratio
+- /broadcast, /ban, /unban
 
 ---
 
@@ -21,9 +45,12 @@ A full-featured Telegram bot that looks up **IP geolocation** and **postal/zip c
 
 | Layer | Tech |
 |-------|------|
+| Language | Python 3.12+ |
 | Bot framework | python-telegram-bot 21+ (async) |
 | HTTP client | httpx (async) |
-| Storage | SQLite |
+| DNS | asyncio + socket (stdlib) |
+| WHOIS | RDAP (httpx) |
+| Storage | SQLite (WAL mode) |
 | Config | python-dotenv |
 | Deployment | Railway (Pro, persistent volume) |
 
@@ -34,25 +61,27 @@ A full-featured Telegram bot that looks up **IP geolocation** and **postal/zip c
 ```
 .
 ├── main.py                     # Entry point — builds & starts the bot
-├── config.py                   # Loads env vars
+├── config.py                   # Loads env vars & API URLs
 ├── handlers/
 │   ├── __init__.py
-│   ├── user_handlers.py        # /start /help /ip /zip /history /export
+│   ├── user_handlers.py        # /start /help /ip /domain /whois /rdns /scan /zip /history /export
 │   └── admin_handlers.py       # /stats /broadcast /ban /unban
 ├── services/
 │   ├── __init__.py
-│   ├── database.py             # SQLite: init, users, lookups, cache, stats
-│   └── geolocation.py          # ip-api.com & zippopotam.us API calls
+│   ├── database.py             # SQLite: init, migrations, users, lookups, cache, stats
+│   └── geolocation.py          # ip-api, zippopotam, RDAP whois, DNS, risk analysis
 ├── utils/
 │   ├── __init__.py
-│   └── ratelimit.py            # In-memory per-user cooldown
+│   ├── ratelimit.py            # In-memory per-user cooldown
+│   └── formatters.py           # Professional emoji-section message formatting
 ├── data/                       # SQLite DB lives here (mounted volume on Railway)
 ├── requirements.txt
 ├── Procfile
 ├── railway.toml
 ├── .env.example
 ├── .gitignore
-└── README.md
+├── README.md
+└── FeatureList.md
 ```
 
 ---
@@ -72,13 +101,10 @@ A full-featured Telegram bot that looks up **IP geolocation** and **postal/zip c
    ```
 
 3. **Get a bot token from [@BotFather](https://t.me/BotFather)**
-   - Open a chat with @BotFather
-   - Send `/newbot`
-   - Follow the prompts to name it
-   - Copy the token it gives you
+   - Open a chat with @BotFather → `/newbot` → follow prompts → copy token
 
 4. **Find your Telegram user ID** (for admin access)
-   - Open [@userinfobot](https://t.me/userinfobot) and send any message — it replies with your numeric user ID.
+   - Open [@userinfobot](https://t.me/userinfobot) → send any message → get your numeric ID
 
 5. **Configure environment variables**
    ```bash
@@ -95,9 +121,9 @@ A full-featured Telegram bot that looks up **IP geolocation** and **postal/zip c
    ```bash
    python main.py
    ```
-   You should see logs like:
+   Logs:
    ```
-   [INFO] Initializing database...
+   [INFO] Database initialized at ./data/bot.db
    [INFO] Starting bot (long-polling)...
    ```
 
@@ -107,10 +133,10 @@ A full-featured Telegram bot that looks up **IP geolocation** and **postal/zip c
 
 ### 1. Create a new Railway project
 - Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**
-- Point it to your repo containing this code.
+- Select your repo
 
 ### 2. Set environment variables
-In Railway → your service → **Variables** tab, add:
+In Railway → your service → **Variables** tab:
 
 | Variable | Value |
 |----------|-------|
@@ -119,19 +145,16 @@ In Railway → your service → **Variables** tab, add:
 | `DB_PATH` | `/app/data/bot.db` |
 
 ### 3. Attach a persistent volume
-Because the bot uses SQLite, the database file must survive restarts.
-
-- Go to **Settings** → **Volumes** → **Add Volume**
+- **Settings** → **Volumes** → **Add Volume**
 - **Mount path:** `/app/data`
-- This ensures `DB_PATH=/app/data/bot.db` persists across deploys.
+- This keeps the SQLite database across restarts
 
 ### 4. Deploy
-Railway auto-detects the `Procfile` and runs:
+Railway auto-detects the `Procfile`:
 ```
 worker: python main.py
 ```
-
-The bot starts in long-polling mode. Logs go to stdout (visible in Railway's **Logs** tab).
+Logs appear in Railway's **Logs** tab.
 
 ---
 
@@ -143,37 +166,47 @@ The bot starts in long-polling mode. Logs go to stdout (visible in Railway's **L
 |---------|-------------|
 | `/start` | Welcome message & overview |
 | `/help` | Show all commands |
-| `/ip <ip>` | Geolocate an IP address (IPv4/IPv6) |
-| `/zip <code>` | Look up a postal/zip code (defaults to US) |
+| `/ip <ip>` | IP intelligence report (geo + ISP + ASN + risk + maps) |
+| `/domain <domain>` | Resolve & geolocate a domain (IPv4/IPv6 + risk + maps) |
+| `/whois <ip\|domain>` | WHOIS / RDAP lookup |
+| `/rdns <ip>` | Reverse DNS (PTR record) |
+| `/scan` | Bulk IP scan from TXT/CSV file → CSV report |
+| `/zip <code>` | Postal/zip code lookup (US default) |
 | `/zip <country> <code>` | Look up a code in a specific country |
-| `/history` | View your last 10 lookups |
-| `/export` | Download your full history as a CSV file |
+| `/history` | View last 10 lookups (with risk levels) |
+| `/export` | Download full history as CSV |
 
 ### Admin Commands
 *(Restricted to user IDs in `ADMIN_IDS`)*
 
 | Command | Description |
 |---------|-------------|
-| `/stats` | Bot usage statistics (users, lookups, top queries) |
-| `/broadcast <message>` | Send a message to every registered user |
-| `/ban <user_id>` | Ban a user from using the bot |
+| `/stats` | Full statistics: users, lookups, top countries/ISPs/domains, daily graph, avg time, cache ratio |
+| `/broadcast <message>` | Message all users |
+| `/ban <user_id>` | Ban a user |
 | `/unban <user_id>` | Unban a user |
 
 ---
 
 ## 🌐 Data Sources
 
-- **IP Geolocation:** [ip-api.com](http://ip-api.com) (free tier, 45 req/min, no API key)
-- **Postal/Zip Lookup:** [zippopotam.us](https://api.zippopotam.us) (free, no API key, supports US/CA/UK/etc.)
+| Source | Use | Key needed |
+|--------|-----|------------|
+| [ip-api.com](http://ip-api.com) | IP geolocation + proxy/hosting/mobile flags + reverse DNS | No (free, 45 req/min) |
+| [zippopotam.us](https://api.zippopotam.us) | Postal/zip code lookup | No |
+| [RDAP](https://rdap.org) / [arin.net](https://rdap.arin.net) | WHOIS for IPs and domains | No |
+| Python `socket` / `asyncio` | DNS resolution & reverse DNS | N/A (stdlib) |
 
-⚠️ *IP geolocation is approximate (city-level) and does not reveal an exact street address.*
+⚠️ *IP geolocation is approximate (city-level) and does not reveal an exact street address. Risk analysis only uses reliable API data — never fabricated.*
 
 ---
 
 ## 🔒 Notes
 
-- All SQL queries use parameterized statements (no injection risk).
-- Per-user rate limit: 3 seconds between lookups (in-memory dict).
-- Cache TTL: 30 minutes (stored in SQLite `cache` table).
-- Bot token is never hardcoded — read from `BOT_TOKEN` env var.
-- Logging at INFO (stdout) — Railway captures stdout automatically.
+- All SQL queries use parameterized statements (no injection risk)
+- Per-user rate limit: 3 seconds between lookups (in-memory)
+- Cache TTL: 30 minutes (SQLite `cache` table) — covers IP, zip, domain, whois, rdns
+- Bot token read from `BOT_TOKEN` env var (never hardcoded)
+- Logging at INFO (stdout) — Railway captures automatically
+- Database migrations are non-destructive (`ALTER TABLE ADD COLUMN` guarded by PRAGMA checks)
+- Bulk scan respects ip-api rate limits (pauses every 45 requests)
